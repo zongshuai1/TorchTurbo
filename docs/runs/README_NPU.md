@@ -325,5 +325,25 @@ engine_config:
 
 HyperMulticore determines communication workspace capacity from the current routing counts.
 
-MegaMoE uses an NPU provider through `ops.mega_moe`. CUDA and CPU calls
-to this operator are unsupported.
+Enable HotReplica with `moe.enable_hot_replica: true`. The two MoE options are independent.
+
+| `enable_mega_moe` | `enable_hot_replica` | Routed experts |
+|---|---|---|
+| `false` | `false` | TorchTurbo expert parallelism |
+| `false` | `true` | TorchTurbo expert parallelism with HMC HotReplica placement |
+| `true` | `false` | HMC MegaMoE through `ops.mega_moe` |
+| `true` | `true` | HMC MegaMoE with adaptive HotReplica placement |
+
+With both options enabled, the NPU provider constructs the executor with
+`expert_placement=MegaMoePlacementOptions(strategy="adaptive", planner=planner)`.
+Each forward calls the executor directly. MegaMoE uses the validated routing
+counts to ask the planner whether to replicate experts. With HotReplica alone,
+TorchTurbo uses the placement in its existing
+token dispatch, expert computation and combine path. HMC lends the expert weights
+and returns borrowed gradients to the owning rank with FP32 accumulation.
+The original route is used when the planner declines a move. Activation
+checkpointing can reuse the route and borrowed weights from the original forward.
+
+HotReplica requires an HMC build with HotReplica support, Atlas A3, BF16 full-parameter
+training and EP size greater than one. The joint path uses MegaMoE push dispatch.
+CUDA and CPU calls to `ops.mega_moe` are unsupported.

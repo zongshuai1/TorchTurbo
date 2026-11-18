@@ -53,8 +53,14 @@ class HmcMegaMoe(OpImpl):
 
         executor = self._executors.get(context)
         if executor is None:
-            executor = self._create_executor(context)
-            self._executors[context] = executor
+            for reference in context.reservation_contexts:
+                variant = reference()
+                if variant is not None and variant not in self._executors:
+                    self._executors[variant] = self._create_executor(variant)
+            executor = self._executors.get(context)
+            if executor is None:
+                executor = self._create_executor(context)
+                self._executors[context] = executor
 
         local = context.num_experts // dist.get_world_size(context.ep_group)
         weights = (
@@ -63,19 +69,29 @@ class HmcMegaMoe(OpImpl):
         )
         if executor.training != training:
             executor.train(training)
-        return executor(inputs, expert_indices.int(), probs, expert_weights=weights)
+        ids = expert_indices.int()
+        return executor(inputs, ids, probs, expert_weights=weights)
 
     @staticmethod
     def _create_executor(context: MegaMoeContext) -> MegaMoeExperts:
         """Register a model variant before its first resource allocation."""
         from hyper_multicore import MegaMoeExperts, MegaMoeNumericsOptions
 
+        options = {}
+        if context.enable_hot_replica:
+            from hyper_multicore import MegaMoePlacementOptions
+            from hyper_multicore.modules.hot_replica.planner import HotReplicaPlanner
+
+            options["expert_placement"] = MegaMoePlacementOptions(
+                strategy="adaptive", planner=HotReplicaPlanner(source_token_bound=context.source_token_bound),
+            )
         return MegaMoeExperts(
             hidden_size=context.hidden_size,
             intermediate_size=context.intermediate_size,
             num_experts=context.num_experts,
             top_k=context.top_k,
             ep_group=context.ep_group,
+            **options,
             numerics_options=MegaMoeNumericsOptions(
                 swiglu_limit=context.swiglu_limit,
                 clamp_after_silu=context.clamp_after_silu,

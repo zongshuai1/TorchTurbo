@@ -458,6 +458,8 @@ class FSDP2Backend(BaseBackend):
         # Phase 1: Module replacement (e.g., MoE layers).
         model = self._replace_modules(model, plan)
 
+        if self.config.moe.enable_hot_replica and peft_config is not None:
+            raise ValueError("HotReplica does not support LoRA.")
         if self.config.moe.enable_mega_moe:
             if peft_config is not None:
                 logger.warning_rank0("Using native experts for LoRA instead of MegaMoE.")
@@ -467,7 +469,17 @@ class FSDP2Backend(BaseBackend):
 
                 if self.device_runtime.device.type != "npu":
                     raise ValueError("MegaMoE requires the Ascend NPU runtime.")
-                bind_mega_moe(model, self.get_ep_info()["ep_group"])
+                bind_mega_moe(
+                    model, self.get_ep_info()["ep_group"],
+                    enable_hot_replica=self.config.moe.enable_hot_replica,
+                    source_token_bound=self.config.moe._source_token_bound,
+                )
+        elif self.config.moe.enable_hot_replica:
+            from ....models.modules.moe.hot_replica import bind_hot_replica
+
+            if self.device_runtime.device.type != "npu":
+                raise ValueError("HotReplica requires the Ascend NPU runtime.")
+            bind_hot_replica(model, self.get_ep_info()["ep_group"])
 
         # Phase 2: Apply LoRA (after module replacement, before sharding).
         if peft_config is not None:
@@ -846,7 +858,9 @@ class FSDP2Backend(BaseBackend):
 
         from torchturbo.models.modules.moe.moe_layer import BaseMoELayer, MoERuntimeInputs
 
-        from .activation_checkpointing import fsdp_recompute_context, restore_moe_runtime_inputs
+        from .activation_checkpointing import (
+            FSDPModule, expert_parameter_version, fsdp_recompute_context, restore_moe_runtime_inputs,
+        )
 
         target_modules: list[tuple[str, nn.Module]] = []
         for fqn, submodule in model.named_modules():
@@ -885,6 +899,7 @@ class FSDP2Backend(BaseBackend):
             module: nn.Module,
             use_reentrant: bool,
             moe_runtime_inputs: tuple[tuple[BaseMoELayer, MoERuntimeInputs], ...],
+            *, descendants: tuple[FSDPModule, ...] | None = None,
         ) -> Iterator[None]:
             # The recompute context is active only in backward. Expert containers
             # can be nested FSDP units under the checkpointed layer, and their
@@ -894,9 +909,9 @@ class FSDP2Backend(BaseBackend):
             with ExitStack() as stack:
                 stack.enter_context(restore_moe_runtime_inputs(moe_runtime_inputs))
                 stack.enter_context(
-                    self.prefetch_manager.suspend_expert_forward_prefetch(model)
+                    self.prefetch_manager.suspend_expert_forward_prefetch(model, descendants=descendants)
                 )
-                stack.enter_context(fsdp_recompute_context(module, use_reentrant))
+                stack.enter_context(fsdp_recompute_context(module, use_reentrant, descendants=descendants))
                 yield
 
         def make_checkpointed_forward(module: nn.Module):
@@ -906,6 +921,10 @@ class FSDP2Backend(BaseBackend):
             )
 
             use_reentrant = self.config.activation_checkpointing.use_reentrant
+            wrap_checkpoint = None
+            descendants = None
+            if use_reentrant and len(moe_modules) == 1 and self.config.moe.enable_hot_replica:
+                from hyper_multicore.modules.hot_replica.checkpoint import wrap_checkpoint
 
             @functools.wraps(original_forward)
             def checkpointed_forward(*args, **kwargs):
@@ -944,11 +963,24 @@ class FSDP2Backend(BaseBackend):
                         context_fn=checkpoint_context_fn,
                     )
 
+                run_forward = base_fn
+                if wrap_checkpoint is not None:
+                    expert = moe_modules[0].experts
+                    run_forward = wrap_checkpoint(
+                        base_fn, lambda: expert_parameter_version(expert), prepare_replay=True,
+                    )
+
                 def run_fn(*a, **kw):
+                    nonlocal descendants
                     if torch.is_grad_enabled():
-                        with recompute_context(module, True, moe_runtime_inputs):
-                            return base_fn(*a, **kw)
-                    return base_fn(*a, **kw)
+                        if wrap_checkpoint is not None and descendants is None:
+                            descendants = tuple(
+                                child for child in module.modules()
+                                if child is not module and isinstance(child, FSDPModule)
+                            )
+                        with recompute_context(module, True, moe_runtime_inputs, descendants=descendants):
+                            return run_forward(*a, **kw)
+                    return run_forward(*a, **kw)
 
                 if torch.is_grad_enabled() and not any(
                     isinstance(arg, torch.Tensor) and arg.requires_grad for arg in args

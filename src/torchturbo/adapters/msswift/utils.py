@@ -59,9 +59,18 @@ def build_config_from_swift_args(args: Any) -> EngineConfig:
         tt.moe_aux_loss_coeff = args.router_aux_loss_coef
 
     config = build_from_args(tt)
-    if config.moe.enable_mega_moe and vars(args).get("tuner_type") == "lora":
-        logger.warning_rank0("Using native experts for LoRA instead of MegaMoE.")
-        config.moe.enable_mega_moe = False
+    if vars(args).get("tuner_type") == "lora":
+        if config.moe.enable_hot_replica:
+            raise ValueError("HotReplica does not support LoRA.")
+        if config.moe.enable_mega_moe:
+            logger.warning_rank0("Using native experts for LoRA instead of MegaMoE.")
+            config.moe.enable_mega_moe = False
+    if config.moe.enable_mega_moe and config.moe.enable_hot_replica:
+        length = (args.packing_length or args.max_length) if args.packing else args.max_length
+        if length is not None:
+            tokens = length * args.per_device_train_batch_size
+            sp_size = config.parallel_plan.sp_size
+            config.moe._source_token_bound = (tokens + sp_size - 1) // sp_size
     return config
 
 

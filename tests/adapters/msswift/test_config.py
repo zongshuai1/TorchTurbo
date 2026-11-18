@@ -788,3 +788,17 @@ def test_mega_moe_uses_dynamic_hmc_capacity():
 def test_mega_moe_lora_keeps_native_experts():
     _set_tt(enable_mega_moe=True)
     assert not build_config_from_swift_args(_base_args(tuner_type="lora")).moe.enable_mega_moe
+
+
+def test_joint_hot_replica_passes_switch_and_rejects_lora():
+    _set_tt(enable_mega_moe=True, enable_hot_replica=True, sp_size=8)
+    args = _base_args()
+    args.packing = True
+    args.packing_length = 65536
+    args.max_length = 32768
+    args.per_device_train_batch_size = 1
+    config = build_config_from_swift_args(args)
+    assert config.moe._source_token_bound == 8192
+    assert config.moe.enable_mega_moe and config.moe.enable_hot_replica
+    with pytest.raises(ValueError, match="does not support LoRA"):
+        build_config_from_swift_args(_base_args(tuner_type="lora"))

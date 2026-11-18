@@ -174,6 +174,7 @@ class TorchTurboArgs:
     enable_mtp: bool = False
     mtp_loss_scaling_factor: float | None = 0.1
     enable_mega_moe: bool | None = None
+    enable_hot_replica: bool | None = None
     moe_aux_loss_coeff: float = 0.0
     moe_z_loss_coeff: float = 0.0
     moe_token_dispatcher: str | None = None
@@ -522,6 +523,11 @@ _TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
         name="enable_mega_moe",
         args_name="enable_mega_moe",
         config_path="moe.enable_mega_moe",
+    ),
+    TurboArgSpec(
+        name="enable_hot_replica",
+        args_name="enable_hot_replica",
+        config_path="moe.enable_hot_replica",
     ),
     TurboArgSpec(
         name="moe_token_dispatcher",

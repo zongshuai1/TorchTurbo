@@ -106,6 +106,7 @@ class MoELayer(BaseMoELayer):
         sp_group: dist.ProcessGroup | None = None,
     ) -> None:
         self.mega_moe_backend = None
+        self.native_hot_replica = None
         self.use_te = use_te
         self.submodules = submodules
         super(MoELayer, self).__init__(
@@ -147,6 +148,50 @@ class MoELayer(BaseMoELayer):
                 self.submodules.shared_experts, config=self.config
             )
 
+    def _dispatch_experts(
+        self, hidden_states, routing_map, probs, expert_indices, route=None, selected=None,
+    ):
+        dispatcher = self.token_dispatcher
+        route_options = {}
+        expert_options = {}
+        cache = None
+        if route is not None:
+            cache = self.native_hot_replica.replay(route, hidden_states, selected)
+            placement = route.placement
+            route_options["counts_by_source"] = route.counts
+            route_options["selected_probs"] = selected
+            if placement is not None:
+                dispatcher = self.native_hot_replica.dispatcher(placement.borrowed_capacity)
+                route_options["counts_by_source"] = placement.counts_by_source
+                expert_indices = placement.virtual_ids
+                expert_options["hot_replica_route"] = self.native_hot_replica.replica, route
+            if cache is not None:
+                expert_options["hot_replica_cache"] = cache
+                if route.replay:
+                    tokens, expert_probs = cache.dispatch(hidden_states, selected)
+                    # Enter the FSDP wrapper even when all expert forwards are cached.
+                    expert_output, _ = self.experts(
+                        tokens, cache.layout.tokens_per_expert, expert_probs, **expert_options,
+                    )
+                    return cache.combine(expert_output)
+
+        tokens, expert_probs = dispatcher.dispatch_preprocess(
+            hidden_states, routing_map, probs, expert_indices=expert_indices, **route_options,
+        )
+        tokens, expert_probs = dispatcher.token_dispatch(tokens, expert_probs)
+        tokens, tokens_per_expert, expert_probs = dispatcher.dispatch_postprocess(tokens, expert_probs)
+        if cache is not None:
+            cache.capture_dispatch(dispatcher, tokens, expert_probs)
+        tokens, bias = self.experts(tokens, tokens_per_expert, expert_probs, **expert_options)
+        assert bias is None, "Bias is not supported in MoEAlltoAllTokenDispatcher"
+        tokens = dispatcher.combine_preprocess(tokens)
+        tokens = dispatcher.token_combine(tokens)
+        output = dispatcher.combine_postprocess(tokens).to(hidden_states.dtype)
+        if cache is not None:
+            cache.output = output.detach()
+            route.record.activation = cache
+        return output
+
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -161,22 +206,12 @@ class MoELayer(BaseMoELayer):
             output, _ = self.experts(
                 hidden_states, None, probs, mega_moe_backend=self.mega_moe_backend, expert_indices=expert_indices,
             )
+        elif self.native_hot_replica is not None:
+            selected = probs.gather(1, expert_indices.long())
+            route = self.native_hot_replica.prepare(hidden_states, expert_indices, selected, routing_map)
+            output = self._dispatch_experts(hidden_states, routing_map, probs, expert_indices, route, selected)
         else:
-            dispatcher = self.token_dispatcher
-            # Reuse stage variables so completed layouts are not kept alive here.
-            expert_tokens, expert_probs = dispatcher.dispatch_preprocess(
-                hidden_states, routing_map, probs, expert_indices=expert_indices,
-            )
-            expert_tokens, expert_probs = dispatcher.token_dispatch(expert_tokens, expert_probs)
-            expert_tokens, tokens_per_expert, expert_probs = dispatcher.dispatch_postprocess(
-                expert_tokens, expert_probs,
-            )
-            expert_tokens, bias = self.experts(expert_tokens, tokens_per_expert, expert_probs)
-            assert bias is None, "Bias is not supported in MoEAlltoAllTokenDispatcher"
-            expert_tokens = dispatcher.combine_preprocess(expert_tokens)
-            expert_tokens = dispatcher.token_combine(expert_tokens)
-            expert_tokens = dispatcher.combine_postprocess(expert_tokens)
-            output = expert_tokens.to(hidden_states.dtype)
+            output = self._dispatch_experts(hidden_states, routing_map, probs, expert_indices)
 
         if self.shared_expert is not None:
             shared_expert_output = self.shared_expert(hidden_states)

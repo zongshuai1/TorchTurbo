@@ -17,6 +17,8 @@ from torchturbo.ops import ops
 from torchturbo.logging import get_logger
 
 if TYPE_CHECKING:
+    from hyper_multicore.modules.hot_replica.runtime import HotReplica, HotReplicaRoute
+    from .hot_replica_replay import ExpertReplay
     from torchturbo.engine.optimizers import MuonParameterSpec
     from torchturbo.ops.moe import MegaMoeContext
 
@@ -186,6 +188,21 @@ class GroupedMLP(torch.nn.Module):
         hidden_states = self.activation_func(hidden_states)
         return (hidden_states * probs).to(hidden_states.dtype)
 
+    def _grouped_experts(self, inputs, w1, w2, counts, probs, cache=None, weight_grad_targets=None):
+        if weight_grad_targets is None:
+            fc1 = ops.grouped_matmul(inputs, w1, counts, trans_b=False)
+        else:
+            from torchturbo.ops.providers.npu.grouped_matmul import grouped_matmul_with_fp32_weight_grad
+
+            fc1 = grouped_matmul_with_fp32_weight_grad(inputs, w1, counts, weight_grad_targets[0])
+
+        if cache is not None:
+            cache.fc1 = fc1.detach()
+        activated = self.activation_func_with_probs(fc1, probs)
+        if weight_grad_targets is None:
+            return ops.grouped_matmul(activated, w2, counts, trans_b=False)
+        return grouped_matmul_with_fp32_weight_grad(activated, w2, counts, weight_grad_targets[1])
+
     def forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
@@ -194,6 +211,8 @@ class GroupedMLP(torch.nn.Module):
         *,
         mega_moe_backend: "MegaMoeContext | None" = None,
         expert_indices: torch.Tensor | None = None,
+        hot_replica_route: tuple["HotReplica", "HotReplicaRoute"] | None = None,
+        hot_replica_cache: "ExpertReplay | None" = None,
     ) -> tuple[torch.Tensor, None]:
         """Apply routing probabilities inside each expert before its second linear."""
         if mega_moe_backend is not None:
@@ -203,6 +222,17 @@ class GroupedMLP(torch.nn.Module):
                 context=mega_moe_backend, training=self.training,
             )
             return output, None
+        borrowed = None
+        weight_grad_targets = None
+        if hot_replica_route is not None:
+            replica, route = hot_replica_route
+            hidden = self.config.hidden_size
+            dtype = permuted_local_hidden_states.dtype
+            owners = (
+                self.weight1.view(self.num_local_experts, hidden, -1),
+                self.weight2.view(self.num_local_experts, -1, hidden),
+            )
+            borrowed, weight_grad_targets = replica.borrow_for_fp32_gradients(owners, route, compute_dtype=dtype)
         if self.config.moe_apply_probs_on_input:
             assert (
                 self.config.moe_router_topk == 1
@@ -244,25 +274,30 @@ class GroupedMLP(torch.nn.Module):
 
             # Second grouped linear: fc2_input_size -> hidden_size
             fc2_output = self.fc2_linear(intermediate_parallel, m_splits)
-        elif permuted_local_hidden_states.nelement() != 0:
+        elif borrowed is not None or permuted_local_hidden_states.nelement() != 0:
             # Fall back to the grouped_matmul op registry.
             # Reshape the weights for the grouped GEMMs.
-            w1 = self.weight1.view(
-                self.num_local_experts, self.config.hidden_size, -1
-            )
-            w2 = self.weight2.view(
-                self.num_local_experts, -1, self.config.hidden_size
-            )
+            if borrowed is None:
+                w1 = self.weight1.view(self.num_local_experts, self.config.hidden_size, -1)
+                w2 = self.weight2.view(self.num_local_experts, -1, self.config.hidden_size)
+            else:
+                w1, w2 = borrowed
 
-            fc1_output = ops.grouped_matmul(
-                permuted_local_hidden_states, w1, tokens_per_expert, trans_b=False
-            )
-            intermediate_parallel = self.activation_func_with_probs(
-                fc1_output, activation_probs
-            )
-            fc2_output = ops.grouped_matmul(
-                intermediate_parallel, w2, tokens_per_expert, trans_b=False
-            )
+            if hot_replica_cache is not None and hot_replica_cache.fc1 is not None:
+                from torchturbo.ops.providers.npu.grouped_matmul import replay_grouped_matmuls
+
+                # The cached combine consumes the FC2 result. Use a shape-matched
+                # tensor so the original GroupedMatmul backward remains connected.
+                with replay_grouped_matmuls(hot_replica_cache.fc1, permuted_local_hidden_states.detach()):
+                    fc2_output = self._grouped_experts(
+                        permuted_local_hidden_states, w1, w2, tokens_per_expert, activation_probs,
+                        weight_grad_targets=weight_grad_targets,
+                    )
+            else:
+                fc2_output = self._grouped_experts(
+                    permuted_local_hidden_states, w1, w2, tokens_per_expert, activation_probs, hot_replica_cache,
+                    weight_grad_targets=weight_grad_targets,
+                )
         else:
             # No token is allocated for local experts.
             assert torch.count_nonzero(tokens_per_expert) == 0

@@ -1,6 +1,8 @@
 """Launch with torchrun -m pytest on two A3 ranks (EP) or four (EP plus FSDP)."""
 
 import os
+from contextlib import nullcontext
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -15,7 +17,7 @@ from torchturbo.models.modules.moe.mega_moe import bind_mega_moe
 from torchturbo.models.modules.moe.module import ModuleSpec
 from torchturbo.models.modules.moe.moe_config import MoEConfig
 from torchturbo.models.modules.moe.moe_layer import MoELayer, MoESubmodules
-from torchturbo.ops import get_or_create_ops, OpPolicy
+from torchturbo.ops import get_ops, get_or_create_ops, OpPolicy
 from torchturbo.runtime import get_device_runtime
 
 
@@ -34,8 +36,9 @@ def expert_mesh():
 
 
 @pytest.mark.skipif(int(os.environ.get("WORLD_SIZE", 1)) not in (2, 4), reason="requires two or four torchrun ranks")
+@pytest.mark.parametrize("enable_hot_replica", [False, True])
 @pytest.mark.parametrize("hot_route", [False, True])
-def test_mega_moe_matches_native_expert_parallel(expert_mesh, hot_route):
+def test_mega_moe_matches_native_expert_parallel(expert_mesh, enable_hot_replica, hot_route):
     from torch.utils.checkpoint import checkpoint
 
     mesh = expert_mesh
@@ -59,7 +62,7 @@ def test_mega_moe_matches_native_expert_parallel(expert_mesh, hot_route):
             native.router.weight.fill_(-0.01)
             native.router.weight[:2].fill_(0.01)
     candidate.load_state_dict(native.state_dict())
-    bind_mega_moe(candidate, ep_group)
+    bind_mega_moe(candidate, ep_group, enable_hot_replica=enable_hot_replica)
     if dist.get_world_size() == 4:
         fully_shard(candidate.experts, mesh=mesh["edp"], mp_policy=MixedPrecisionPolicy(
             param_dtype=torch.bfloat16, reduce_dtype=torch.float32, cast_forward_inputs=False,
@@ -74,10 +77,29 @@ def test_mega_moe_matches_native_expert_parallel(expert_mesh, hot_route):
         native.zero_grad(set_to_none=True)
         candidate.zero_grad(set_to_none=True)
         expected, _ = native(x)
-        actual, _ = checkpoint(candidate, other, use_reentrant=False) if recompute else candidate(other)
+        # Small correctness cases force placement; performance tests use
+        # the unmodified cost model.
+        policy = (
+            patch("hyper_multicore.modules.hot_replica.planner.placement_is_profitable", return_value=True)
+            if hot_route and enable_hot_replica else nullcontext()
+        )
+        capacity = (
+            patch("hyper_multicore.modules.hot_replica.planner.placement_receive_limit",
+                  side_effect=lambda average, *_: average)
+            if hot_route and enable_hot_replica else nullcontext()
+        )
+        with policy, capacity:
+            actual, _ = checkpoint(candidate, other, use_reentrant=False) if recompute else candidate(other)
         upstream = torch.randn_like(expected)
         expected.backward(upstream)
-        actual.backward(upstream)
+        with policy, capacity:
+            actual.backward(upstream)
+        if hot_route and enable_hot_replica:
+            provider = get_ops()._impls["hmc_mega_moe"]
+            executor = provider._executors[candidate.mega_moe_backend]
+            placement = executor._resource_group.resources.placement
+            assert placement.statistics["placements"] > 0
+            assert placement.pool.statistics["gradient_returns"] > 0
         pairs = [(actual, expected), (other.grad, x.grad)]
         for name, param in candidate.named_parameters():
             gradient = param.grad.full_tensor() if isinstance(param.grad, DTensor) else param.grad

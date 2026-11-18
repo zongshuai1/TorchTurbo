@@ -1431,9 +1431,19 @@ def test_gbs_zero_raises():
         build_from_args(TorchTurboArgs(gbs=0))
 
 
-def test_mega_moe_yaml_config(tmp_path):
-    path = _write(tmp_path, "mega.yaml", _engine_config("moe:\n  enable_mega_moe: true\n"))
+@pytest.mark.parametrize("replica", [False, True])
+def test_mega_moe_yaml_config(tmp_path, replica):
+    path = _write(tmp_path, "mega.yaml", _engine_config(
+        f"moe:\n  enable_mega_moe: true\n  enable_hot_replica: {str(replica).lower()}\n"
+    ))
     config = _build_from_argv(["--tt_config", path])
     assert config.moe.enable_mega_moe
+    assert config.moe.enable_hot_replica is replica
     assert not hasattr(config.moe, "local_token_capacity")
-    assert not _build_from_argv([]).moe.enable_mega_moe
+    defaults = _build_from_argv([]).moe
+    assert not defaults.enable_mega_moe and not defaults.enable_hot_replica
+
+
+def test_hot_replica_can_enable_native_ep():
+    moe = EngineConfig.from_dict({"moe": {"enable_hot_replica": True}}).moe
+    assert moe.enable_hot_replica and not moe.enable_mega_moe

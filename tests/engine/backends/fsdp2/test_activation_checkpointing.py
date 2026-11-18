@@ -283,3 +283,109 @@ def test_recompute_context_limits_non_reentrant_hooks_to_older_torch(
     with activation_checkpointing.fsdp_recompute_context(fsdp_parent, use_reentrant):
         assert len(child._forward_pre_hooks) == len(original_hooks) + extra_hooks
     assert child._forward_pre_hooks == original_hooks
+
+
+def test_native_hot_replica_replay_preserves_dispatch_combine_and_gradients(cpu_ops, monkeypatch):
+    """Cached dispatch and combine attach the same adjoints as the native path."""
+    from torchturbo.models.modules.moe import hot_replica_replay
+
+    calls = []
+
+    def exchange(group, value, output, input_):
+        calls.append((output, input_))
+        return value
+
+    monkeypatch.setattr(hot_replica_replay, "all_to_all", exchange)
+    x = torch.randn((2, 3), requires_grad=True)
+    scores = torch.randn((2, 2), requires_grad=True)
+    weight = torch.randn((3, 3), requires_grad=True)
+    ids = torch.tensor([[1, 0], [0, 1]])
+    order = ids.flatten().argsort(stable=True)
+    inverse = torch.empty_like(order).scatter_(0, order, torch.arange(4)).view_as(ids)
+    packed_rows = order // ids.shape[1]
+    packed = x.index_select(0, packed_rows)
+    packed_probs = scores.flatten().index_select(0, order)
+    projected = (packed * packed_probs.unsqueeze(1)) @ weight
+    reference = projected.index_select(0, inverse.flatten()).view(2, 2, 3).sum(1)
+
+    dispatcher = SimpleNamespace(
+        input_splits=(3, 1), output_splits=(1, 3), num_local_experts=1, ep_group=None,
+        num_global_tokens_per_local_expert=torch.tensor([[1], [3]]), tokens_per_expert=torch.tensor([4]),
+        permutation_row_indices=inverse, permutation_expert_indices=ids,
+    )
+    cache = hot_replica_replay.ExpertReplay(reservation=object())
+    cache.capture_dispatch(dispatcher, packed, packed_probs)
+    cache.output = reference.detach()
+    routed, coefficients = cache.dispatch(x, scores)
+    replayed = cache.combine((routed * coefficients.unsqueeze(1)) @ weight)
+    torch.testing.assert_close(replayed, reference)
+    grad = torch.randn_like(reference)
+    actual = torch.autograd.grad(replayed, (x, scores, weight), grad)
+    expected = torch.autograd.grad(reference, (x, scores, weight), grad)
+    torch.testing.assert_close(actual, expected)
+    assert calls == [((1, 3), (3, 1)), ((3, 1), (1, 3)), ((3, 1), (1, 3))]
+
+
+def test_grouped_matmul_replay_reuses_original_backward(monkeypatch):
+    """Cached GroupedMatmul outputs skip both forward GEMMs and still differentiate."""
+    from torchturbo.ops.providers.npu.grouped_matmul import _TorchNpuGroupedMatmul, replay_grouped_matmuls
+
+    calls = []
+
+    def grouped_mm(inputs, weights, *, group_type, **kwargs):
+        calls.append(group_type)
+        if group_type == 2:
+            return [(inputs[0] @ weights[0]).unsqueeze(0)]
+        return [inputs[0] @ weights[0][0]]
+
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(npu_grouped_matmul=grouped_mm))
+    x = torch.randn((4, 3), requires_grad=True)
+    weight1 = torch.randn((1, 3, 5), requires_grad=True)
+    weight2 = torch.randn((1, 5, 3), requires_grad=True)
+    fc1 = x @ weight1[0]
+    reference = fc1.sin() @ weight2[0]
+    groups = torch.tensor([4])
+    with replay_grouped_matmuls(fc1, reference):
+        projected = _TorchNpuGroupedMatmul.apply(x, weight1, groups, False)
+        replayed = _TorchNpuGroupedMatmul.apply(projected.sin(), weight2, groups, False)
+    assert not calls
+    actual = torch.autograd.grad(replayed.sum(), (x, weight1, weight2))
+    expected = torch.autograd.grad(reference.sum(), (x, weight1, weight2))
+    torch.testing.assert_close(actual, expected)
+    assert calls == [0, 2, 0, 2]
+
+
+def test_grouped_matmul_replay_keeps_hot_replica_weight_partial_in_fp32(monkeypatch):
+    """Forward replay preserves the FP32 gradient edge for borrowed weights."""
+    from torchturbo.ops.providers.npu.grouped_matmul import (
+        grouped_matmul_with_fp32_weight_grad,
+        replay_grouped_matmuls,
+    )
+
+    calls = []
+
+    def grouped_mm(inputs, weights, *, group_type, **kwargs):
+        calls.append(group_type)
+        return [inputs[0] @ weights[0][0]]
+
+    def accumulate(result, x, dy, ends, *, group_list_type):
+        assert result.dtype == torch.float32
+        assert ends.tolist() == [2] and group_list_type == 0
+        result.add_(x.float().T @ dy.float())
+        calls.append('fp32')
+
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(
+        npu_grouped_matmul=grouped_mm, npu_grouped_matmul_add_=accumulate,
+    ))
+    x = torch.tensor([[1, 0.01], [0.001, 1]], dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.ones((1, 2, 3), dtype=torch.bfloat16)
+    target = torch.empty_like(weight, dtype=torch.float32, requires_grad=True)
+    original = x.detach() @ weight[0]
+    with replay_grouped_matmuls(original):
+        result = grouped_matmul_with_fp32_weight_grad(x, weight, torch.tensor([2]), target)
+    assert not calls
+    result.sum().backward()
+    assert calls == [0, 'fp32']
+    assert target.grad.dtype == torch.float32
+    expected = x.detach().float().T @ torch.ones_like(result, dtype=torch.float32)
+    torch.testing.assert_close(target.grad, expected.unsqueeze(0), rtol=0, atol=0)

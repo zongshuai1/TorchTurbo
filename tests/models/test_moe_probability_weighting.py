@@ -223,7 +223,7 @@ def test_checkpoint_keeps_each_runtime_mask_with_frozen_inputs(use_reentrant):
         config=EngineConfig.from_dict({
             "activation_checkpointing": {"enabled": True, "use_reentrant": use_reentrant},
         }),
-        prefetch_manager=SimpleNamespace(suspend_expert_forward_prefetch=lambda model: nullcontext()),
+        prefetch_manager=SimpleNamespace(suspend_expert_forward_prefetch=lambda model, *, descendants=None: nullcontext()),
     )
     FSDP2Backend._apply_activation_checkpointing(
         backend, candidate, SimpleNamespace(modules={"": FSDPPlanSpec(activation_checkpoint=True)}),
@@ -297,7 +297,7 @@ def test_expert_checkpoint_with_frozen_inputs_preserves_parameter_gradients(
         config=EngineConfig.from_dict({
             "activation_checkpointing": {"enabled": True, "use_reentrant": use_reentrant},
         }),
-        prefetch_manager=SimpleNamespace(suspend_expert_forward_prefetch=lambda model: nullcontext()),
+        prefetch_manager=SimpleNamespace(suspend_expert_forward_prefetch=lambda model, *, descendants=None: nullcontext()),
     )
     plan = SimpleNamespace(modules={"experts": FSDPPlanSpec(activation_checkpoint=True)})
     FSDP2Backend._apply_activation_checkpointing(backend, layer, plan)
@@ -333,7 +333,7 @@ def test_expert_checkpoint_with_disabled_adapters_preserves_router_gradients(use
         config=EngineConfig.from_dict({
             "activation_checkpointing": {"enabled": True, "use_reentrant": use_reentrant},
         }),
-        prefetch_manager=SimpleNamespace(suspend_expert_forward_prefetch=lambda model: nullcontext()),
+        prefetch_manager=SimpleNamespace(suspend_expert_forward_prefetch=lambda model, *, descendants=None: nullcontext()),
     )
     plan = SimpleNamespace(modules={"experts": FSDPPlanSpec(activation_checkpoint=True)})
     FSDP2Backend._apply_activation_checkpointing(backend, layer, plan)
@@ -374,7 +374,8 @@ def test_frozen_experts_preserve_the_router_gradient_graph(freeze_router):
         torch.testing.assert_close(layer.router.weight.grad, reference.router.weight.grad)
 
 
-def test_mega_moe_reads_fp32_master_weights_inside_expert_hooks(monkeypatch):
+@pytest.mark.parametrize("enable_hot_replica", [False, True])
+def test_mega_moe_reads_fp32_master_weights_inside_expert_hooks(monkeypatch, enable_hot_replica):
     from torchturbo.ops.moe import MegaMoeContext
     from torchturbo.ops.providers.npu.mega_moe import HmcMegaMoe
     from torchturbo.ops import get_ops
@@ -394,7 +395,7 @@ def test_mega_moe_reads_fp32_master_weights_inside_expert_hooks(monkeypatch):
             coeff = probs[:, 0].reshape(3, 2, 1).to(inputs.dtype)
             return inputs * coeff * (w1.mean() + w2.mean())
 
-    context = MegaMoeContext(object(), 4, 3, 2, 2, None, False)
+    context = MegaMoeContext(object(), 4, 3, 2, 2, None, False, enable_hot_replica)
     provider = HmcMegaMoe()
     provider._executors[context] = Executor()
     monkeypatch.setattr(get_ops(), "mega_moe", provider)

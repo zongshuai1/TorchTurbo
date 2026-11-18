@@ -17,6 +17,10 @@ from torchturbo.runtime import TurboDevice
 def hmc(monkeypatch):
     constructed = []
 
+    class Planner:
+        def __init__(self, *, source_token_bound):
+            self.source_token_bound = source_token_bound
+
     class Executor(torch.nn.Module):
         def __init__(self, **configuration):
             super().__init__()
@@ -31,8 +35,12 @@ def hmc(monkeypatch):
             return inputs * (scale * probs.sum(dim=-1, keepdim=True)).to(inputs.dtype)
 
     monkeypatch.setitem(
+        sys.modules, "hyper_multicore.modules.hot_replica.planner",
+        SimpleNamespace(HotReplicaPlanner=Planner),
+    )
+    monkeypatch.setitem(
         sys.modules, "hyper_multicore",
-        SimpleNamespace(MegaMoeExperts=Executor, MegaMoeNumericsOptions=SimpleNamespace),
+        SimpleNamespace(MegaMoeExperts=Executor, MegaMoeNumericsOptions=SimpleNamespace, MegaMoePlacementOptions=SimpleNamespace),
     )
     monkeypatch.setattr(hmc_provider, "find_spec", lambda name: object())
     monkeypatch.setattr(hmc_provider.dist, "get_world_size", lambda group: 2)
@@ -72,6 +80,7 @@ def test_dispatch_keeps_live_weights_and_reuses_context(hmc, policy):
     assert all(args[i].grad is not None for i in (0, 2, 3, 4))
     assert len(hmc) == 1
     assert hmc[0].configuration["ep_group"] is context.ep_group
+    assert "expert_placement" not in hmc[0].configuration
     assert vars(hmc[0].configuration["numerics_options"]) == {
         "swiglu_limit": 0.5, "clamp_after_silu": True, "apply_probs_before_fc2": True,
     }
@@ -138,3 +147,17 @@ def test_invalid_inputs_fail_before_workspace_creation(hmc, invalid):
     with pytest.raises(ValueError):
         dispatcher().mega_moe(*args, context=context)
     assert not hmc
+
+
+@pytest.mark.parametrize("bound", [None, 4096])
+def test_joint_mode_injects_planner_once(hmc, bound):
+    args, context = inputs()
+    context = replace(context, enable_hot_replica=True, source_token_bound=bound)
+    op = dispatcher()
+    op.mega_moe(*args, context=context)
+    op.mega_moe(*args, context=context)
+    assert len(hmc) == 1
+    assert len(hmc[0].weights) == 2
+    placement = hmc[0].configuration["expert_placement"]
+    assert placement.strategy == "adaptive"
+    assert placement.planner.source_token_bound == bound

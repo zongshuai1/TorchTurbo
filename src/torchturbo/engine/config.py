@@ -22,7 +22,7 @@ import os
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Literal, get_args, get_type_hints
+from typing import Any, ClassVar, Literal, get_args, get_type_hints
 
 from omegaconf import OmegaConf
 
@@ -477,9 +477,12 @@ class MoEConfig:
     """Expert token dispatcher type."""
 
     enable_mega_moe: bool = False
+    enable_hot_replica: bool = False
+    _source_token_bound: ClassVar[int | None] = None
 
     def __post_init__(self) -> None:
         self.enable_mega_moe = string_to_bool(self.enable_mega_moe)
+        self.enable_hot_replica = string_to_bool(self.enable_hot_replica)
         if self.token_dispatcher != "alltoall":
             raise ValueError("moe.token_dispatcher must be 'alltoall'.")
 
@@ -1317,6 +1320,7 @@ def _build_moe_config(fields: Mapping[str, Any]) -> MoEConfig:
     moe_d = fields.get("moe") or {}
     return MoEConfig(
         enable_mega_moe=moe_d.get("enable_mega_moe", False),
+        enable_hot_replica=moe_d.get("enable_hot_replica", False),
         aux_loss_coeff=float(moe_d.get("aux_loss_coeff", 0.0)),
         z_loss_coeff=float(moe_d.get("z_loss_coeff", 0.0)),
         token_dispatcher=moe_d.get("token_dispatcher", "alltoall"),

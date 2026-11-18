@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from weakref import ReferenceType
 
 import torch
 import torch.distributed as dist
@@ -82,3 +83,6 @@ class MegaMoeContext:
     top_k: int
     swiglu_limit: float | None
     clamp_after_silu: bool
+    enable_hot_replica: bool = False
+    source_token_bound: int | None = None
+    reservation_contexts: list[ReferenceType[MegaMoeContext]] = field(default_factory=list, repr=False)

@@ -37,6 +37,8 @@ class MoETokenDispatcher(ABC):
         probs: torch.Tensor,
         *,
         expert_indices: torch.Tensor | None = None,
+        counts_by_source: torch.Tensor | None = None,
+        selected_probs: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Group source tokens by destination expert and prepare counts."""
         raise NotImplementedError
@@ -122,19 +124,26 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.input_splits: torch.Tensor | np.ndarray | None = None
         self.output_splits: torch.Tensor | np.ndarray | None = None
 
-    def preprocess(self, routing_map: torch.Tensor) -> torch.Tensor:
+    def preprocess(
+        self, routing_map: torch.Tensor, counts_by_source: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Compute device counts and split sizes without copying them to CPU."""
         # Source counts are ordered by destination rank, then expert.
-        local_counts = routing_map.sum(dim=0).long()
+        if counts_by_source is None:
+            local_counts = routing_map.sum(dim=0).long()
+        else:
+            local_counts = counts_by_source[dist.get_rank(self.ep_group)]
         self.input_splits = None
         self.output_splits = None
         if self.ep_size > 1:
             self.input_splits = local_counts.reshape(
                 self.ep_size, self.num_local_experts
             ).sum(axis=1)
-            global_counts = gather_from_sequence_parallel_region(
-                local_counts, group=self.ep_group
-            ).reshape(self.ep_size, self.num_experts)
+            global_counts = counts_by_source
+            if global_counts is None:
+                global_counts = gather_from_sequence_parallel_region(
+                    local_counts, group=self.ep_group,
+                ).reshape(self.ep_size, self.num_experts)
             received_counts = global_counts[
                 :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
             ].contiguous()
@@ -153,18 +162,20 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         probs: torch.Tensor,
         *,
         expert_indices: torch.Tensor | None = None,
+        counts_by_source: torch.Tensor | None = None,
+        selected_probs: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Group source tokens and probabilities for weighting inside the experts."""
         self.hidden_shape = hidden_states.shape
         assert probs.dim() == 2, "Expected 2D tensor for probs"
         assert routing_map.dim() == 2, "Expected 2D tensor for token2expert mask"
         assert routing_map.dtype == torch.bool, "Expected bool tensor for mask"
-        self.tokens_per_expert = self.preprocess(routing_map)
+        self.tokens_per_expert = self.preprocess(routing_map, counts_by_source)
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
         self.hidden_shape_before_permute = hidden_states.shape
         self._maybe_dtoh_and_synchronize("before_permutation_1")
         permutation = ops.moe_permutation(
-            hidden_states, routing_map, probs=probs,
+            hidden_states, routing_map, probs=probs if selected_probs is None else None,
             num_out_tokens=routing_map.size(0) * self.config.moe_router_topk,
             expert_indices=expert_indices,
         )
@@ -173,7 +184,13 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.permutation_row_indices = permutation.row_indices
         self.permutation_expert_indices = permutation.expert_indices
         self._maybe_dtoh_and_synchronize("before_ep_alltoall")
-        return permutation.tokens, permutation.probs
+        if selected_probs is None:
+            return permutation.tokens, permutation.probs
+        scores = selected_probs.flatten()
+        packed_probs = torch.empty_like(scores).index_put(
+            (permutation.row_indices.reshape(-1).long(),), scores,
+        )
+        return permutation.tokens, packed_probs
 
     def token_dispatch(
         self, hidden_states: torch.Tensor, probs: torch.Tensor,

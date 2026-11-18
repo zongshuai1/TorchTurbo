@@ -472,7 +472,7 @@ class FSDPPrefetchManager:
 
     @contextmanager
     def suspend_expert_forward_prefetch(
-        self, model: Optional[nn.Module] = None
+        self, model: Optional[nn.Module] = None, *, descendants=None
     ) -> Iterator[None]:
         """Temporarily disable expert-source forward prefetch.
 
@@ -489,7 +489,8 @@ class FSDPPrefetchManager:
             if state is None or state.model is not model:
                 sources = []
             else:
-                sources = list(state.expert_forward_prefetch_targets)
+                targets = state.expert_forward_prefetch_targets
+                sources = list(targets) if descendants is None else [unit for unit in descendants if unit in targets]
         if not sources:
             yield
             return

@@ -118,6 +118,7 @@ engine_config:
     z_loss_coeff: 0.0
     token_dispatcher: alltoall
     enable_mega_moe: false        # Ascend A3, BF16, ep_size > 1
+    enable_hot_replica: false          # HMC expert placement for native EP or MegaMoE
 
   mtp:
     enabled: false

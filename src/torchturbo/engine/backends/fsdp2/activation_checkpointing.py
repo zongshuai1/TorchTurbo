@@ -48,7 +48,9 @@ def _restart_reentrant_forward(submodule: FSDPModule, _args: tuple[Any, ...]) ->
 
 
 @contextmanager
-def fsdp_recompute_context(module: nn.Module, use_reentrant: bool) -> Iterator[None]:
+def fsdp_recompute_context(
+    module: nn.Module, use_reentrant: bool, *, descendants: tuple[FSDPModule, ...] | None = None
+) -> Iterator[None]:
     """Prepare descendant FSDP units only while recomputation is active.
 
     Non-reentrant early-stop can skip FSDP's post-forward cleanup, so it must
@@ -62,8 +64,21 @@ def fsdp_recompute_context(module: nn.Module, use_reentrant: bool) -> Iterator[N
     with ExitStack() as stack:
         # Prepare each nested unit when it runs, keeping normal backward
         # resharding and limiting live full parameters.
-        for child in module.modules():
-            if child is not module and isinstance(child, FSDPModule):
-                handle = child.register_forward_pre_hook(hook, prepend=use_reentrant)
-                stack.callback(handle.remove)
+        if descendants is None:
+            descendants = tuple(
+                child for child in module.modules() if child is not module and isinstance(child, FSDPModule)
+            )
+        for child in descendants:
+            handle = child.register_forward_pre_hook(hook, prepend=use_reentrant)
+            stack.callback(handle.remove)
         yield
+
+
+def expert_parameter_version(module: nn.Module) -> tuple[tuple[int, int], ...]:
+    """Track the persistent FSDP shards across temporary full-weight restoration."""
+    if isinstance(module, FSDPModule):
+        group = module._get_fsdp_state()._fsdp_param_group
+        parameters = tuple(parameter.sharded_param for parameter in group.fsdp_params)
+    else:
+        parameters = tuple(module.parameters(recurse=False))
+    return tuple((id(parameter), parameter._version) for parameter in parameters)
