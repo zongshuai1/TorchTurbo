@@ -12,7 +12,7 @@ from torchturbo.logging import get_logger
 from torchturbo.runtime import DeviceRuntime, TurboDevice
 
 from .base import OpImpl, OpImplKind, OpPolicy, OpSpec
-from .moe import MoEPermutation, get_expert_indices
+from .moe import MegaMoeContext, MoEPermutation, get_expert_indices
 from .packed_params import get_packed_params
 from .providers import iter_provider_modules
 from .registry import OpRegistry
@@ -525,6 +525,45 @@ class OpDispatcher:
     ):
         return self._dispatch(
             "lightning_indexer_metadata", *args, impl=impl, **kwargs
+        )
+
+    def mega_moe(
+        self,
+        inputs: torch.Tensor,
+        expert_indices: torch.Tensor,
+        probs: torch.Tensor,
+        weight1: torch.Tensor,
+        weight2: torch.Tensor,
+        *,
+        context: MegaMoeContext,
+        training: bool = True,
+        impl: str | None = None,
+    ) -> torch.Tensor:
+        """Run expert-parallel SwiGLU with HMC's shared communication workspace.
+
+        Args:
+            inputs: Local BF16 source tokens, shaped [tokens, hidden_size].
+            expert_indices: Global expert IDs, shaped [tokens, top_k].
+            probs: Selected routing weights in the same slot order as the IDs.
+            weight1: Unsharded local expert weights, [local * hidden, 2 * intermediate].
+            weight2: Unsharded local expert weights, [local * intermediate, hidden].
+            context: EP group and numerics shared by serial model layers.
+            training: Module training mode; Torch autograd controls gradient recording.
+            impl: Optional provider selection, taking precedence over the override.
+
+        Returns:
+            Combined BF16 features shaped like inputs, differentiable with
+            respect to inputs, probs and both expert weights. Probabilities are
+            applied after SwiGLU and before FC2.
+
+        This HMC-specific operator requires a custom NPU provider. CUDA and CPU
+        calls raise RuntimeError, including explicit HMC provider selection.
+        Strict native policy raises; ordinary EP is selected by disabling
+        enable_mega_moe.
+        """
+        return self._dispatch(
+            "mega_moe", inputs, expert_indices, probs, weight1, weight2,
+            context=context, training=training, impl=impl,
         )
 
     def moe_permutation(

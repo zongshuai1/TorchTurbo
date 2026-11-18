@@ -58,7 +58,11 @@ def build_config_from_swift_args(args: Any) -> EngineConfig:
     if vars(args).get("rlhf_type") == "dpo" and tt.moe_aux_loss_coeff == 0.0:
         tt.moe_aux_loss_coeff = args.router_aux_loss_coef
 
-    return build_from_args(tt)
+    config = build_from_args(tt)
+    if config.moe.enable_mega_moe and vars(args).get("tuner_type") == "lora":
+        logger.warning_rank0("Using native experts for LoRA instead of MegaMoE.")
+        config.moe.enable_mega_moe = False
+    return config
 
 
 def build_lora_config_from_swift_args(args: Any) -> Any | None:
